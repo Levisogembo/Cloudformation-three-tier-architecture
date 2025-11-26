@@ -1,0 +1,320 @@
+Description: A three-tier architecture with ALB, ASG and RDS
+
+Parameters:
+  InstanceType:
+    Description: List of of allowed ec2 instance types
+    Type: String
+    AllowedValues:
+      - t3.micro
+      - t2.micro
+
+  DataCenters:
+    Description: Various Azs
+    Type: String
+    AllowedValues:
+      - eu-west-2a
+      - eu-west-2b
+      - eu-west-2c
+
+  DBName:
+    Type: String
+    Default: rdsMysql
+
+  DBUser:
+    Type: String
+    Default: admin
+
+  DBPassword:
+    Type: String
+    Description: Password for the RDS instance
+    NoEcho: true
+    MinLength: 8
+    Default: admin12345
+
+Resources:
+  # MyEc2Instance:
+  #   Type: AWS::EC2::Instance
+  #   Properties:
+  #     AvailabilityZone: !Ref DataCenters
+  #     InstanceType: !Ref InstanceType
+  #     ImageId: !FindInMap [Images, !Ref "AWS::Region", Ami]
+  #     SecurityGroups:
+  #       - !Ref Ec2SecurityGroups
+
+  MyVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: MyVPC
+
+  MyInternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  MyInternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref MyVPC
+      InternetGatewayId: !Ref MyInternetGateway
+
+  MyNatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  MyNatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt MyNatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  ##Public and private gateways
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.100.0/24
+      AvailabilityZone: eu-west-2b
+      MapPublicIpOnLaunch: true
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.101.0/24
+      AvailabilityZone: eu-west-2c
+      MapPublicIpOnLaunch: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: eu-west-2b
+      MapPublicIpOnLaunch: false
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref MyVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: eu-west-2c
+      MapPublicIpOnLaunch: false
+
+  ##Route tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: MyInternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref MyInternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref MyVPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref MyNatGateway
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  RdsPrivateSubnet:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnet for launching the rds instance
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  RdsMysqlDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref DBName
+      MasterUsername: !Ref DBUser
+      MasterUserPassword: !Ref DBPassword
+      Engine: mysql
+      EngineVersion: 8.0
+      AllocatedStorage: 20
+      DBInstanceClass: db.t4g.micro
+      PubliclyAccessible: false
+      MultiAZ: false
+      DBSubnetGroupName: !Ref RdsPrivateSubnet
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroups
+      StorageType: gp3
+      DeletionProtection: false
+
+  AsgLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [Images, !Ref "AWS::Region", Ami]
+        InstanceType: !Ref InstanceType
+        SecurityGroupIds:
+          - !GetAtt Ec2SecurityGroups.GroupId
+        UserData: !Base64 |
+          #!/bin/bash
+          sudo dnf update -y
+          echo "Installing basic tools..."
+          sudo dnf install -y curl tar gzip
+          echo "Installing Node.js 22..."
+          curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+          source ~/.bashrc
+          nvm install 22
+          nvm use 22
+          nvm alias default 22
+          sudo dnf install -y npm
+          echo "Node version: $(node -v)"
+          echo "NPM version: $(npm -v)"
+          sudo npm install -g pm2
+          
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AsgLaunchTemplate
+        Version: !GetAtt AsgLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      TargetGroupARNs:
+        - !Ref MyTargetGroups
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 30
+
+  RdsSecurityGroups:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      GroupDescription: Allowing access to the db only from the ec2 instances
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt Ec2SecurityGroups.GroupId
+
+  Ec2SecurityGroups:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref MyVPC
+      GroupDescription: Defines the ports from which the application can be accessed
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroups
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          SourceSecurityGroupId: !Ref AlbSecurityGroups
+
+  AlbSecurityGroups:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Application load balancer
+      VpcID: !Ref MyVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0
+
+  MyTargetGroups:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: myTg
+      VpcId: !Ref MyVPC
+      Protocol: HTTP
+      Port: 3000
+      TargetType: instance
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      # Targets:
+      #   - Id: !GetAtt MyEc2Instance.InstanceId
+      #     Port: 3000
+
+  MyLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ec2-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroups
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref MyLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref MyTargetGroups
+
+Mappings:
+  Images:
+    eu-west-2:
+      Ami: ami-03f3a22c5f8f5ef58
+
+Outputs:
+  AlbDns:
+    Description: ALB DNs
+    Value: !GetAtt MyLoadBalancer.DNSName
+  RdsEndPoint:
+    Description: RDS EndPoint
+    Value: !GetAtt RdsMysqlDatabase.Endpoint.Address
